@@ -59,7 +59,7 @@ func main() {
 			if encrypted, err := encrypt(CIPHER_KEY, msg); err != nil {
 				log.Println(err)
 			} else {
-				err := writer(encrypted, filename+"_encryptedFile")
+				err := writer(encrypted, filedir+filename+"_encryptedFile")
 				if err != nil {
 					log.Println(err)
 					return
