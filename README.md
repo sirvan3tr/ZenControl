@@ -42,5 +42,3 @@ id, filename, filedir, status
 
 ensure the forward or backward slash is included at the end of filedir
 
-Thanks
-Sirvan
