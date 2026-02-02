@@ -1,10 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"database/sql"
 	"encoding/base64"
 	"errors"
 	"flag"
@@ -15,35 +15,38 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-
-	_ "github.com/mattn/go-sqlite3"
 )
 
 const (
-	statusEncrypted  = "encrypted"
-	statusDecrypted  = "decrypted"
-	encryptedSuffix  = "_encryptedFile"
-	defaultDBPath    = "./files.db"
+	statusEncrypted   = "encrypted"
+	statusDecrypted   = "decrypted"
+	encryptedSuffix   = "_encryptedFile"
+	defaultManifest   = "./files.txt"
 	defaultUnlockHour = 19
-	defaultFilePerm  = 0600
+	defaultFilePerm   = 0600
+	manifestFilePerm  = 0600
 )
 
 var errUsage = errors.New("usage")
 
 type Config struct {
-	Command     string
-	DBPath      string
-	Key         []byte
-	UnlockHour  int
-	Pause       bool
-	AllowLegacy bool
+	Command      string
+	ManifestPath string
+	Key          []byte
+	UnlockHour   int
+	Pause        bool
+	AllowLegacy  bool
 }
 
 type FileRecord struct {
-	ID       int
 	Filename string
 	FileDir  string
 	Status   string
+}
+
+type ManifestLine struct {
+	Raw    string
+	Record *FileRecord
 }
 
 func main() {
@@ -82,7 +85,7 @@ func parseConfig(args []string) (Config, error) {
 	flagSet := flag.NewFlagSet(command, flag.ContinueOnError)
 	flagSet.SetOutput(io.Discard)
 
-	dbPath := flagSet.String("db", defaultDBPath, "path to sqlite database")
+	manifest := flagSet.String("manifest", defaultManifest, "path to manifest file")
 	keyStr := flagSet.String("key", "", "encryption key (16/24/32 bytes). If empty, uses ZENCONTROL_KEY env")
 	unlockHour := flagSet.Int("unlock-hour", defaultUnlockHour, "local hour (0-23) after which decryption is allowed")
 	pause := flagSet.Bool("pause", false, "pause for Enter before exit")
@@ -112,12 +115,12 @@ func parseConfig(args []string) (Config, error) {
 	}
 
 	return Config{
-		Command:     command,
-		DBPath:      *dbPath,
-		Key:         key,
-		UnlockHour:  *unlockHour,
-		Pause:       *pause,
-		AllowLegacy: *allowLegacy,
+		Command:      command,
+		ManifestPath: *manifest,
+		Key:          key,
+		UnlockHour:   *unlockHour,
+		Pause:        *pause,
+		AllowLegacy:  *allowLegacy,
 	}, nil
 }
 
@@ -125,72 +128,108 @@ func run(cfg Config) error {
 	now := time.Now()
 	log.Printf("time=%s", now.Format(time.RFC3339))
 
-	database, err := sql.Open("sqlite3", cfg.DBPath)
+	lines, err := loadManifest(cfg.ManifestPath)
 	if err != nil {
-		return fmt.Errorf("open db: %w", err)
-	}
-	defer database.Close()
-
-	if err := database.Ping(); err != nil {
-		return fmt.Errorf("ping db: %w", err)
-	}
-	if err := ensureTable(database); err != nil {
-		return fmt.Errorf("ensure table: %w", err)
+		return err
 	}
 
-	rows, err := database.Query("SELECT id, filename, filedir, status FROM files")
-	if err != nil {
-		return fmt.Errorf("query files: %w", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		rec, err := scanFileRecord(rows)
-		if err != nil {
-			log.Printf("scan row: %v", err)
+	changed := false
+	for _, line := range lines {
+		if line.Record == nil {
 			continue
 		}
 
-		if err := processRecord(database, cfg, rec, now); err != nil {
-			log.Printf("id=%d file=%s: %v", rec.ID, rec.Filename, err)
+		updatedStatus, updated, err := processFile(cfg.Command, cfg.Key, *line.Record, now, cfg.UnlockHour, cfg.AllowLegacy)
+		if err != nil {
+			log.Printf("file=%s: %v", line.Record.Filename, err)
+			continue
+		}
+		if updated {
+			line.Record.Status = updatedStatus
+			changed = true
 		}
 	}
 
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("rows error: %w", err)
+	if changed {
+		if err := writeManifest(cfg.ManifestPath, lines); err != nil {
+			return fmt.Errorf("write manifest: %w", err)
+		}
 	}
 
 	return nil
 }
 
-func processRecord(db *sql.DB, cfg Config, rec FileRecord, now time.Time) error {
-	if err := validateRecord(rec); err != nil {
-		return err
-	}
-
-	updatedStatus, updated, err := processFile(cfg.Command, cfg.Key, rec, now, cfg.UnlockHour, cfg.AllowLegacy)
+func loadManifest(path string) ([]ManifestLine, error) {
+	file, err := os.Open(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if !updated {
-		return nil
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	var lines []ManifestLine
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		raw := scanner.Text()
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			lines = append(lines, ManifestLine{Raw: raw})
+			continue
+		}
+
+		rec, err := parseManifestLine(raw)
+		if err != nil {
+			return nil, fmt.Errorf("manifest line %d: %w", lineNum, err)
+		}
+		lines = append(lines, ManifestLine{Record: rec})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
 	}
 
-	if err := updateStatus(db, rec.ID, updatedStatus); err != nil {
-		return fmt.Errorf("update status: %w", err)
-	}
-	return nil
+	return lines, nil
 }
 
-func scanFileRecord(rows *sql.Rows) (FileRecord, error) {
-	var rec FileRecord
-	if err := rows.Scan(&rec.ID, &rec.Filename, &rec.FileDir, &rec.Status); err != nil {
-		return FileRecord{}, err
+func parseManifestLine(line string) (*FileRecord, error) {
+	parts := strings.SplitN(line, "|", 3)
+	if len(parts) != 3 {
+		return nil, errors.New("expected format: filedir|filename|status")
 	}
-	rec.Filename = strings.TrimSpace(rec.Filename)
-	rec.FileDir = strings.TrimSpace(rec.FileDir)
-	rec.Status = strings.TrimSpace(rec.Status)
+	fileDir := strings.TrimSpace(parts[0])
+	filename := strings.TrimSpace(parts[1])
+	status := strings.TrimSpace(parts[2])
+
+	rec := &FileRecord{
+		Filename: filename,
+		FileDir:  fileDir,
+		Status:   status,
+	}
+	if err := validateRecord(*rec); err != nil {
+		return nil, err
+	}
+
 	return rec, nil
+}
+
+func writeManifest(path string, lines []ManifestLine) error {
+	var builder strings.Builder
+	for _, line := range lines {
+		if line.Record == nil {
+			builder.WriteString(line.Raw)
+			builder.WriteByte('\n')
+			continue
+		}
+		builder.WriteString(formatManifestLine(*line.Record))
+		builder.WriteByte('\n')
+	}
+	return writeFileAtomic(path, []byte(builder.String()), manifestFilePerm)
+}
+
+func formatManifestLine(rec FileRecord) string {
+	return fmt.Sprintf("%s|%s|%s", rec.FileDir, rec.Filename, rec.Status)
 }
 
 func validateRecord(rec FileRecord) error {
@@ -212,21 +251,11 @@ func printUsage() {
 	fmt.Println("  ZenControl decrypt [flags]")
 	fmt.Println("")
 	fmt.Println("Flags:")
-	fmt.Println("  -db           path to sqlite database (default ./files.db)")
+	fmt.Println("  -manifest     path to manifest file (default ./files.txt)")
 	fmt.Println("  -key          encryption key (16/24/32 bytes); or set ZENCONTROL_KEY")
 	fmt.Println("  -unlock-hour  local hour (0-23) after which decryption is allowed (default 19)")
 	fmt.Println("  -pause        pause for Enter before exit")
 	fmt.Println("  -allow-legacy allow legacy AES-CFB decrypt for older files")
-}
-
-func ensureTable(db *sql.DB) error {
-	_, err := db.Exec("CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY, filename TEXT, filedir TEXT, status TEXT)")
-	return err
-}
-
-func updateStatus(db *sql.DB, id int, status string) error {
-	_, err := db.Exec("UPDATE files SET status = ? WHERE id = ?", status, id)
-	return err
 }
 
 func processFile(command string, key []byte, rec FileRecord, now time.Time, unlockHour int, allowLegacy bool) (string, bool, error) {
